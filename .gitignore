@@ -157,6 +157,7 @@ coverage/
 *.temp
 *.bak
 *.backup
+status/
 
 # OS specific
 Thumbs.db
