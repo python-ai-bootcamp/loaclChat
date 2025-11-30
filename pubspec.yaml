@@ -11,7 +11,7 @@ dependencies:
     sdk: flutter
   image_picker: ^1.0.7
   flutter_blue_plus: ^1.32.7
-  flutter_blue_plus_windows: ^1.0.0
+  flutter_blue_plus_windows: 1.26.0
   # flutter_ble_peripheral: ^2.0.0
   # NOTE: Disabled due to DLL crash on Windows (segfault 0xc0000005) when no Bluetooth hardware is present.
   # The plugin DLL loads during Flutter's plugin registration phase (before Dart code runs),

@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:flutter_blue_plus_windows/flutter_blue_plus_windows.dart' as fbp;
 // Note: flutter_ble_peripheral is not imported to avoid DLL crash on Windows
 // import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import '../models/discovered_user.dart';
@@ -16,8 +16,8 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
   static const int advertisingIntervalSeconds = 5;
   static const int userTimeoutSeconds = 20;
 
-  StreamSubscription<BluetoothAdapterState>? _adapterStateSubscription;
-  StreamSubscription<List<ScanResult>>? _scanSubscription;
+  StreamSubscription<fbp.BluetoothAdapterState>? _adapterStateSubscription;
+  StreamSubscription<List<fbp.ScanResult>>? _scanSubscription;
   bool _isAdvertising = false;
   bool _isScanning = false;
   bool _isBluetoothAvailable = false;
@@ -41,12 +41,18 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
 
   @override
   Future<void> initialize() async {
-    // Listen to adapter state changes
-    _adapterStateSubscription = FlutterBluePlus.adapterState.listen((state) {
-      if (state == BluetoothAdapterState.on) {
-        // Adapter is on, can start operations
-      }
-    });
+    // Listen to adapter state changes (best-effort; ignore if unsupported)
+    try {
+      _adapterStateSubscription = fbp.FlutterBluePlus.adapterState.listen((state) {
+        print('[BluetoothServiceWindows] Adapter state stream: $state');
+        if (state == fbp.BluetoothAdapterState.on) {
+          // Adapter is on
+        }
+      });
+    } catch (e) {
+      // Some plugin builds may not expose adapterState on Windows; ignore
+      print('[BluetoothServiceWindows] adapterState stream unsupported: $e');
+    }
 
     // Start cleanup timer to remove stale users
     _cleanupTimer = Timer.periodic(const Duration(seconds: 2), (_) {
@@ -60,7 +66,8 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
       await initialize();
 
       // Check if Bluetooth is supported - this will throw UnsupportedError if no hardware
-      final supported = await FlutterBluePlus.isSupported;
+      final supported = await fbp.FlutterBluePlus.isSupported;
+      print('[BluetoothServiceWindows] FlutterBluePlus.isSupported: $supported');
       if (!supported) {
         _isBluetoothAvailable = false;
         throw UnsupportedError(
@@ -70,17 +77,17 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
         );
       }
 
-      // Check adapter state - if adapter exists but is off, return false (not an error)
+      // Probe by starting a short scan; if it succeeds, adapter is effectively ON
       try {
-        final state = await FlutterBluePlus.adapterState.first.timeout(
-          const Duration(seconds: 2),
+        print('[BluetoothServiceWindows] Probing scan start...');
+        await fbp.FlutterBluePlus.startScan(
+          timeout: const Duration(seconds: 2),
+          withServices: [fbp.Guid(serviceUuid)],
         );
-        if (state != BluetoothAdapterState.on) {
-          _isBluetoothAvailable = false;
-          return false;
-        }
+        // If we get here without exception, scanning API is available
+        print('[BluetoothServiceWindows] Scan probe succeeded');
       } catch (e) {
-        // Timeout or error getting adapter state - assume not available
+        print('[BluetoothServiceWindows] Scan probe failed: $e');
         _isBluetoothAvailable = false;
         return false;
       }
@@ -206,15 +213,15 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
 
       // Use flutter_blue_plus_windows for scanning
       // Start scanning
-      _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
+      _scanSubscription = fbp.FlutterBluePlus.scanResults.listen((results) {
         for (var result in results) {
           _processScanResult(result);
         }
       });
 
-      await FlutterBluePlus.startScan(
+      await fbp.FlutterBluePlus.startScan(
         timeout: const Duration(seconds: 0), // Scan indefinitely
-        withServices: [Guid(serviceUuid)],
+        withServices: [fbp.Guid(serviceUuid)],
       );
     } catch (e) {
       print('Error starting scan: $e');
@@ -237,7 +244,7 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
     }
 
     try {
-      await FlutterBluePlus.stopScan();
+      await fbp.FlutterBluePlus.stopScan();
       await _scanSubscription?.cancel();
       _scanSubscription = null;
       _isScanning = false;
@@ -246,11 +253,11 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
     }
   }
 
-  void _processScanResult(ScanResult result) {
+  void _processScanResult(fbp.ScanResult result) {
     try {
       // Try to get data from service data first
       final serviceData = result.advertisementData.serviceData;
-      final serviceGuid = Guid(serviceUuid);
+      final serviceGuid = fbp.Guid(serviceUuid);
       
       List<int>? userDataBytes;
       

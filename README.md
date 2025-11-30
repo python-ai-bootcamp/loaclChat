@@ -80,10 +80,10 @@ Platform specifics:
 Choose a target device/platform and run:
 
 ```bash
-flutter run -d windows   # Windows (scan only)
+flutter run -d windows   # Windows: scanning supported; advertising disabled
 flutter run -d android   # Android
 flutter run -d ios       # iOS
-flutter run -d chrome    # Web (BLE discovery not supported)
+flutter run -d chrome    # Web: BLE scanning/advertising not supported (no discovery)
 ```
 
 ## Permissions and platform notes
