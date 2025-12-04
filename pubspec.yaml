@@ -12,13 +12,7 @@ dependencies:
   image_picker: ^1.0.7
   flutter_blue_plus: ^1.32.7
   flutter_blue_plus_windows: 1.26.0
-  # flutter_ble_peripheral: ^2.0.0
-  # NOTE: Disabled due to DLL crash on Windows (segfault 0xc0000005) when no Bluetooth hardware is present.
-  # The plugin DLL loads during Flutter's plugin registration phase (before Dart code runs),
-  # causing a crash if Bluetooth hardware is not available.
-  # The app now checks for Bluetooth availability early and shows a graceful error page.
-  # Advertising is disabled on Windows - users can scan but not advertise.
-  # To re-enable: uncomment the line above and rebuild. May still crash if no Bluetooth hardware.
+  flutter_ble_peripheral: ^2.0.0
   permission_handler: ^11.3.1
 
 dev_dependencies:

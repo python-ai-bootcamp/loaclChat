@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'dart:io' show Platform;
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import '../models/discovered_user.dart';
 import 'bluetooth_service.dart';
+import 'package:flutter_ble_peripheral/flutter_ble_peripheral.dart';
 import 'bluetooth_service_windows.dart';
 import 'bluetooth_service_stub.dart' show BluetoothServiceWeb;
 
@@ -115,57 +117,36 @@ class BluetoothServiceMobile extends BluetoothServiceBase {
     _currentUserId = userId;
 
     try {
-      // Encode user data
-      final userDataBytes = _encodeUserData(userId, nickname);
-      
-      // Create advertisement data
-      final advertisementData = AdvertisementData(
-        advName: nickname,
-        serviceUuids: [Guid(serviceUuid)],
-        serviceData: {Guid(serviceUuid): userDataBytes},
-        manufacturerData: {}, // Empty manufacturer data
-        txPowerLevel: 0,
-        appearance: 0,
-        connectable: true,
-      );
+      // Android: advertise via flutter_ble_peripheral using manufacturer data
+      if (Platform.isAndroid) {
+        print('[BLE Adv] startAdvertising invoked (Android) for userId="$userId", nickname="$nickname"');
+        final userDataBytes =
+            Uint8List.fromList(_encodeUserData(userId, nickname));
 
-      // Start advertising - only on non-Windows platforms
-      if (Platform.isWindows) {
-        throw UnsupportedError('Advertising not supported on Windows in mobile implementation');
+        final advertiseData = AdvertiseData(
+          // Keep the payload minimal to stay within 31-byte legacy ADV
+          // Do not include localName or 128-bit service UUID here.
+          manufacturerId: 0xFFFF,
+          manufacturerData: userDataBytes,
+        );
+
+        final peripheral = FlutterBlePeripheral();
+        await peripheral.start(advertiseData: advertiseData);
+        try {
+          final previewLen = userDataBytes.length > 16 ? 16 : userDataBytes.length;
+          final hexPreview = userDataBytes
+              .sublist(0, previewLen)
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join(' ');
+          print('[BLE Adv] started: manufacturerId=0xFFFF, payloadLen=${userDataBytes.length}, payloadHex[0..${previewLen - 1}]= $hexPreview');
+        } catch (_) {}
+        _isAdvertising = true;
+        return;
       }
-      final flutterBluePlus = FlutterBluePlus;
-      final adapter = (flutterBluePlus as dynamic).adapter;
-      await (adapter as dynamic).startAdvertising(
-        advertisementData,
-        timeout: const Duration(seconds: 0), // Advertise indefinitely
-      );
 
-      _isAdvertising = true;
+      // Other mobile platforms: not supported in this simplified implementation
+      throw UnsupportedError('Advertising not supported on this platform');
 
-      // Restart advertising every 5 seconds to ensure it stays active
-      _advertisingTimer = Timer.periodic(
-        const Duration(seconds: advertisingIntervalSeconds),
-        (timer) async {
-          if (!_isAdvertising) {
-            timer.cancel();
-            return;
-          }
-          try {
-            if (!Platform.isWindows) {
-              final flutterBluePlus = FlutterBluePlus;
-              final adapter = (flutterBluePlus as dynamic).adapter;
-              await (adapter as dynamic).stopAdvertising();
-              await Future.delayed(const Duration(milliseconds: 100));
-              await (adapter as dynamic).startAdvertising(
-                advertisementData,
-                timeout: const Duration(seconds: 0),
-              );
-            }
-          } catch (e) {
-            print('Error restarting advertisement: $e');
-          }
-        },
-      );
     } catch (e) {
       print('Error starting advertising: $e');
       _isAdvertising = false;
@@ -179,11 +160,9 @@ class BluetoothServiceMobile extends BluetoothServiceBase {
     }
 
     try {
-      if (!Platform.isWindows) {
-        final flutterBluePlus = FlutterBluePlus;
-        final adapter = (flutterBluePlus as dynamic).adapter;
-        await (adapter as dynamic).stopAdvertising();
-      }
+      if (Platform.isAndroid) {
+        await FlutterBlePeripheral().stop();
+      } 
       _advertisingTimer?.cancel();
       _advertisingTimer = null;
       _isAdvertising = false;
@@ -199,10 +178,14 @@ class BluetoothServiceMobile extends BluetoothServiceBase {
     }
 
     try {
+      print('[BLE Scan] startScanning begin (mobile)');
       _isScanning = true;
 
       // Start scanning
       _scanSubscription = FlutterBluePlus.scanResults.listen((results) {
+        try {
+          print('[BLE Scan] results batch: ${results.length}');
+        } catch (_) {}
         for (var result in results) {
           _processScanResult(result);
         }
@@ -212,6 +195,7 @@ class BluetoothServiceMobile extends BluetoothServiceBase {
         timeout: const Duration(seconds: 0), // Scan indefinitely
         withServices: [Guid(serviceUuid)],
       );
+      print('[BLE Scan] startScan issued (mobile)');
     } catch (e) {
       print('Error starting scan: $e');
       _isScanning = false;
@@ -238,15 +222,39 @@ class BluetoothServiceMobile extends BluetoothServiceBase {
     try {
       final serviceData = result.advertisementData.serviceData;
       final serviceGuid = Guid(serviceUuid);
-      
-      if (!serviceData.containsKey(serviceGuid)) {
+
+      List<int>? userDataBytes;
+
+      if (serviceData.containsKey(serviceGuid)) {
+        userDataBytes = serviceData[serviceGuid]!;
+      } else {
+        // Fallback: some devices/plugins only populate manufacturer data
+        final manufacturerData = result.advertisementData.manufacturerData;
+        if (manufacturerData.isNotEmpty) {
+          userDataBytes = manufacturerData.values.first;
+        }
+      }
+
+      if (userDataBytes == null) {
+        try {
+          final md = result.advertisementData.manufacturerData;
+          final sd = result.advertisementData.serviceData;
+          print('[BLE Scan] skip adv: name=${result.advertisementData.advName}, md.keys=${md.keys.toList()}, sd.keys=${sd.keys.toList()}');
+        } catch (_) {}
         return;
       }
 
-      // Decode user data from service data
-      final userDataBytes = serviceData[serviceGuid]!;
+      // Decode user data from bytes
       final userData = _decodeUserData(userDataBytes);
       if (userData == null) {
+        try {
+          final previewLen = userDataBytes.length > 16 ? 16 : userDataBytes.length;
+          final hexPreview = userDataBytes
+              .sublist(0, previewLen)
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join(' ');
+          print('[BLE Scan] failed to decode payloadLen=${userDataBytes.length}, hex[0..${previewLen - 1}]= $hexPreview');
+        } catch (_) {}
         return;
       }
 
@@ -266,6 +274,9 @@ class BluetoothServiceMobile extends BluetoothServiceBase {
       );
 
       // Notify listeners
+      try {
+        print('[BLE Scan] discovered user="$nickname" ($userId), total=${_discoveredUsers.length}');
+      } catch (_) {}
       _usersController.add(Map.unmodifiable(_discoveredUsers));
     } catch (e) {
       print('Error processing scan result: $e');
@@ -273,12 +284,30 @@ class BluetoothServiceMobile extends BluetoothServiceBase {
   }
 
   List<int> _encodeUserData(String userId, String nickname) {
-    // Encode user data as JSON and convert to bytes
-    final data = {
+    // Prefer a compact JSON to fit in legacy advertising (<= 31 bytes total).
+    // Truncate nickname defensively.
+    String truncatedNickname = nickname;
+    if (truncatedNickname.runes.length > 12) {
+      truncatedNickname = String.fromCharCodes(truncatedNickname.runes.take(12));
+    }
+
+    // First try full keys
+    var data = {
       'userId': userId,
-      'nickname': nickname,
+      'nickname': truncatedNickname,
     };
-    final jsonString = jsonEncode(data);
+    var jsonString = jsonEncode(data);
+    var bytes = utf8.encode(jsonString);
+    if (bytes.length <= 24) {
+      return bytes;
+    }
+
+    // Fallback to short keys
+    data = {
+      'u': userId,
+      'n': truncatedNickname,
+    };
+    jsonString = jsonEncode(data);
     return utf8.encode(jsonString);
   }
 
@@ -286,10 +315,13 @@ class BluetoothServiceMobile extends BluetoothServiceBase {
     try {
       final jsonString = utf8.decode(data);
       final decoded = jsonDecode(jsonString) as Map<String, dynamic>;
-      return {
-        'userId': decoded['userId'] as String,
-        'nickname': decoded['nickname'] as String,
-      };
+      // Accept both long and short keys
+      final userId = (decoded['userId'] ?? decoded['u']) as String?;
+      final nickname = (decoded['nickname'] ?? decoded['n']) as String?;
+      if (userId == null || nickname == null) {
+        return null;
+      }
+      return {'userId': userId, 'nickname': nickname};
     } catch (e) {
       return null;
     }

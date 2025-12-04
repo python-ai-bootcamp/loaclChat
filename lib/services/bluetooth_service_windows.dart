@@ -31,6 +31,7 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
 
   Timer? _cleanupTimer;
   Timer? _advertisingTimer;
+  Timer? _scanRestartTimer;
 
   @override
   Stream<Map<String, DiscoveredUser>> get discoveredUsersStream =>
@@ -82,32 +83,28 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
         print('[BluetoothServiceWindows] Probing scan start...');
         await fbp.FlutterBluePlus.startScan(
           timeout: const Duration(seconds: 2),
-          withServices: [fbp.Guid(serviceUuid)],
+          // Do not filter here; probe for basic scan capability
         );
         // If we get here without exception, scanning API is available
         print('[BluetoothServiceWindows] Scan probe succeeded');
       } catch (e) {
-        print('[BluetoothServiceWindows] Scan probe failed: $e');
-        _isBluetoothAvailable = false;
-        return false;
+        // Do not fail hard if probing scan fails for transient reasons.
+        // We will still attempt scanning in the main flow.
+        print('[BluetoothServiceWindows] Scan probe failed (continuing): $e');
       }
 
       _isBluetoothAvailable = true;
       return true;
     } catch (e) {
+      // Only treat explicit UnsupportedError (no hardware) as a hard failure
       if (e is UnsupportedError) {
-        // Re-throw UnsupportedError so caller can show appropriate error page
         _isBluetoothAvailable = false;
         rethrow;
       }
-      // For other errors, assume Bluetooth is not available
+      // For other errors, log and report not-ready rather than hard failing
       _isBluetoothAvailable = false;
-      print('Error checking Bluetooth permissions: $e');
-      // Convert to UnsupportedError so UI can handle it gracefully
-      throw UnsupportedError(
-        'Unable to access Bluetooth on this Windows device. '
-        'Please ensure Bluetooth hardware is installed and enabled.',
-      );
+      print('[BluetoothServiceWindows] Error checking Bluetooth: $e');
+      return false;
     }
   }
 
@@ -119,6 +116,7 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
 
     _ensureBluetoothAvailability();
 
+    print('[BluetoothServiceWindows] startAdvertising invoked');
     _currentUserId = userId;
     _currentNickname = nickname;
 
@@ -209,20 +207,46 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
     _ensureBluetoothAvailability();
 
     try {
+      print('[BluetoothServiceWindows] startScanning begin');
       _isScanning = true;
 
       // Use flutter_blue_plus_windows for scanning
       // Start scanning
       _scanSubscription = fbp.FlutterBluePlus.scanResults.listen((results) {
+        try {
+          print('[BluetoothServiceWindows] scanResults batch: ${results.length}');
+        } catch (_) {}
         for (var result in results) {
           _processScanResult(result);
         }
       });
 
       await fbp.FlutterBluePlus.startScan(
-        timeout: const Duration(seconds: 0), // Scan indefinitely
-        withServices: [fbp.Guid(serviceUuid)],
+        // Some Windows stacks behave better with a finite timeout; we'll restart periodically.
+        timeout: const Duration(seconds: 60),
+        // Do not restrict by service UUID to allow manufacturer-only adverts to pass through.
+        // We'll filter by service/manufacturer data in _processScanResult.
       );
+      print('[BluetoothServiceWindows] startScan issued');
+
+      // Periodically restart scan to keep data flowing on some adapters
+      _scanRestartTimer?.cancel();
+      _scanRestartTimer = Timer.periodic(const Duration(seconds: 60), (_) async {
+        if (!_isScanning) {
+          return;
+        }
+        try {
+          print('[BluetoothServiceWindows] restarting scan...');
+          await fbp.FlutterBluePlus.stopScan();
+          await Future.delayed(const Duration(milliseconds: 100));
+          await fbp.FlutterBluePlus.startScan(
+            timeout: const Duration(seconds: 60),
+          );
+          print('[BluetoothServiceWindows] scan restart issued');
+        } catch (e) {
+          print('[BluetoothServiceWindows] scan restart error: $e');
+        }
+      });
     } catch (e) {
       print('Error starting scan: $e');
       _isScanning = false;
@@ -244,6 +268,8 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
     }
 
     try {
+      _scanRestartTimer?.cancel();
+      _scanRestartTimer = null;
       await fbp.FlutterBluePlus.stopScan();
       await _scanSubscription?.cancel();
       _scanSubscription = null;
@@ -255,6 +281,16 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
 
   void _processScanResult(fbp.ScanResult result) {
     try {
+      // Diagnostic: log basic advertisement summary to verify frames are received
+      final mdDiag = result.advertisementData.manufacturerData;
+      final sdDiag = result.advertisementData.serviceData;
+      try {
+        print('[WinScan] name=${result.advertisementData.localName}, '
+            'md.keys=${mdDiag.keys.toList()}, '
+            'md.len=${mdDiag.values.isEmpty ? 0 : mdDiag.values.first.length}, '
+            'sd.keys=${sdDiag.keys.toList()}');
+      } catch (_) {}
+
       // Try to get data from service data first
       final serviceData = result.advertisementData.serviceData;
       final serviceGuid = fbp.Guid(serviceUuid);
@@ -304,12 +340,27 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
   }
 
   List<int> _encodeUserData(String userId, String nickname) {
-    // Encode user data as JSON and convert to bytes
-    final data = {
+    // Mirror Android encoding: compact JSON and truncated nickname to fit legacy adverts
+    String truncatedNickname = nickname;
+    if (truncatedNickname.runes.length > 12) {
+      truncatedNickname = String.fromCharCodes(truncatedNickname.runes.take(12));
+    }
+
+    var data = {
       'userId': userId,
-      'nickname': nickname,
+      'nickname': truncatedNickname,
     };
-    final jsonString = jsonEncode(data);
+    var jsonString = jsonEncode(data);
+    var bytes = utf8.encode(jsonString);
+    if (bytes.length <= 24) {
+      return bytes;
+    }
+
+    data = {
+      'u': userId,
+      'n': truncatedNickname,
+    };
+    jsonString = jsonEncode(data);
     return utf8.encode(jsonString);
   }
 
@@ -317,10 +368,12 @@ class BluetoothServiceWindows extends BluetoothServiceBase {
     try {
       final jsonString = utf8.decode(data);
       final decoded = jsonDecode(jsonString) as Map<String, dynamic>;
-      return {
-        'userId': decoded['userId'] as String,
-        'nickname': decoded['nickname'] as String,
-      };
+      final userId = (decoded['userId'] ?? decoded['u']) as String?;
+      final nickname = (decoded['nickname'] ?? decoded['n']) as String?;
+      if (userId == null || nickname == null) {
+        return null;
+      }
+      return {'userId': userId, 'nickname': nickname};
     } catch (e) {
       return null;
     }
